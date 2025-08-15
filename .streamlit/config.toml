@@ -1,0 +1,7 @@
+[theme]
+base="dark"
+primaryColor="#1E90FF"        # optional: bright blue accents
+backgroundColor="#0E1117"     # dark background
+secondaryBackgroundColor="#262730"
+textColor="#FAFAFA"           # white text
+font="sans serif"
