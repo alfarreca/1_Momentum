@@ -3,8 +3,7 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from data_loader import load_excel, get_history, now_str
-from visualization import display_results, display_symbol_details, download_button_for_df
+from data_loader import load_excel, get_history, now_str, validate_expected_columns, infer_yf_symbol
 
 # ========== APP CONFIG ==========
 MAX_WORKERS = 8
@@ -145,10 +144,7 @@ def calculate_momentum(hist: pd.DataFrame):
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def build_ticker_row(symbol: str, yf_symbol: str):
-    """
-    Pulls history for a ticker, computes momentum, and assembles a single result row (dict).
-    Returns None if insufficient data.
-    """
+    """Pull history, compute momentum, assemble one result row (dict)."""
     hist = get_history(yf_symbol, period="3mo")
     if hist is None or len(hist) < 50:
         return None
@@ -176,6 +172,10 @@ def main():
     st.set_page_config(page_title="S&P 500 Momentum Scanner", layout="wide")
     st.title("S&P 500 Momentum Scanner")
 
+    # Optional: a quick cache clear to ensure apple-to-apple comparisons
+    if st.sidebar.button("Clear cache"):
+        st.cache_data.clear()
+
     uploaded_file = st.file_uploader("Upload Excel file with tickers", type="xlsx")
     if uploaded_file is None:
         st.warning("Please upload a .xlsx file with your tickers.")
@@ -190,23 +190,25 @@ def main():
     st.write(f"Loaded rows from '{selected_sheet}':", len(df_raw))
     st.dataframe(df_raw.head())
 
-    # Validate and clean using data_loader logic
+    # Validate required columns, clean, and preserve any extra columns (e.g., Exchange)
     try:
-        # reuse loader for consistent checks
+        validate_expected_columns(df_raw)
         df = df_raw.copy()
-        from data_loader import validate_expected_columns  # local import to avoid circulars
-        validate_expected_columns(df)
-
         df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
         before = len(df)
         df = df.dropna(subset=["Symbol"]).drop_duplicates("Symbol")
         st.write(f"Dropped rows: {before - len(df)} after cleaning.")
-        df["YF_Symbol"] = df["Symbol"]
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Sidebar filters (keep behavior; Exchange filter removed)
+    # Build YF_Symbol like the original app WHEN an Exchange column exists; otherwise fall back to Symbol
+    if "Exchange" in df.columns:
+        df["YF_Symbol"] = df.apply(lambda r: infer_yf_symbol(r["Symbol"], r["Exchange"]), axis=1)
+    else:
+        df["YF_Symbol"] = df["Symbol"]
+
+    # Sidebar filters (Exchange filter removed; score only)
     min_score = st.sidebar.slider("Min Momentum Score", 0, 100, 50)
 
     # Fetch ticker data concurrently
@@ -227,21 +229,37 @@ def main():
     progress.empty()
 
     results_df = pd.DataFrame(ticker_data)
+    st.session_state["raw_results_df"] = results_df.copy()
 
     if not results_df.empty:
         filtered = results_df[results_df["Momentum_Score"] >= min_score].copy()
     else:
         filtered = pd.DataFrame()
 
-    st.session_state["raw_results_df"] = results_df.copy()
     st.session_state["filtered_results"] = filtered
 
-    # Visualization
-    display_results(filtered)
+    # Display
+    st.metric("Stocks Found", len(filtered))
+    if not filtered.empty and "Momentum_Score" in filtered:
+        st.metric("Avg Momentum Score", round(filtered["Momentum_Score"].mean(), 1))
 
+    st.dataframe(
+        filtered.sort_values("Momentum_Score", ascending=False),
+        use_container_width=True,
+        height=600,
+    )
+
+    # Download results
     if not filtered.empty:
-        download_button_for_df(filtered)
+        csv = filtered.to_csv(index=False)
+        st.download_button(
+            "Download Filtered Results as CSV",
+            data=csv,
+            file_name="momentum_scanner_results.csv",
+            mime="text/csv",
+        )
 
+        # Symbol details
         symbol_options = ["— Select a symbol —"] + filtered["Symbol"].tolist()
         last_selected = st.session_state.get("symbol_select", symbol_options[0])
         if last_selected not in symbol_options:
@@ -254,7 +272,9 @@ def main():
             key="symbol_select",
         )
         if selected != symbol_options[0]:
-            display_symbol_details(selected, filtered)
+            symbol_data = filtered[filtered["Symbol"] == selected].iloc[0]
+            st.subheader(f"{selected} — Detailed Analysis")
+            st.json(symbol_data.to_dict())
 
 
 if __name__ == "__main__":
