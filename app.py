@@ -5,11 +5,10 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from data_loader import (
-    load_excel,
-    get_history,
-    now_str,
     validate_expected_columns,
     infer_yf_symbol,
+    get_history,
+    now_str,
 )
 
 # ========== APP CONFIG ==========
@@ -149,37 +148,11 @@ def calculate_momentum(hist: pd.DataFrame):
     }
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def build_ticker_row(symbol: str, yf_symbol: str):
-    """Pull history, compute momentum, assemble one result row (dict)."""
-    hist = get_history(yf_symbol, period="3mo")
-    if hist is None or len(hist) < 50:
-        return None
-
-    momentum = calculate_momentum(hist)
-    if not momentum:
-        return None
-
-    current_price = hist["Close"].iloc[-1]
-    five_day_change = ((current_price / hist["Close"].iloc[-5] - 1) * 100) if len(hist) >= 5 else None
-    twenty_day_change = ((current_price / hist["Close"].iloc[-20] - 1) * 100) if len(hist) >= 20 else None
-
-    return {
-        "Symbol": symbol,
-        "Price": round(current_price, 2),
-        "5D_Change": round(five_day_change, 1) if five_day_change is not None else None,
-        "20D_Change": round(twenty_day_change, 1) if twenty_day_change is not None else None,
-        **momentum,
-        "Last_Updated": now_str(),
-        "YF_Symbol": yf_symbol,
-    }
-
-
 def main():
     st.set_page_config(page_title="S&P 500 Momentum Scanner", layout="wide")
     st.title("S&P 500 Momentum Scanner")
 
-    # Optional: a quick cache clear to ensure apple-to-apple comparisons
+    # Optional: a quick cache clear to ensure apples-to-apples comparisons
     if st.sidebar.button("Clear cache"):
         st.cache_data.clear()
 
@@ -194,7 +167,7 @@ def main():
     selected_sheet = st.selectbox("Select sheet to analyze", sheet_names, index=0)
 
     df_raw = pd.read_excel(xls, sheet_name=selected_sheet)
-    st.write(f"Loaded rows from '{selected_sheet}':", len(df_raw))
+    st.write(f"Loaded rows from '{selected_sheet}': **{len(df_raw)}**")
     st.dataframe(df_raw.head())
 
     # Validate required columns, clean, and preserve any extra columns (e.g., Exchange)
@@ -204,7 +177,7 @@ def main():
         df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
         before = len(df)
         df = df.dropna(subset=["Symbol"]).drop_duplicates("Symbol")
-        st.write(f"Dropped rows: {before - len(df)} after cleaning.")
+        st.write(f"Dropped rows: **{before - len(df)}** after cleaning.")
     except Exception as e:
         st.error(str(e))
         st.stop()
@@ -215,19 +188,50 @@ def main():
     else:
         df["YF_Symbol"] = df["Symbol"]
 
-    # Sidebar filters (Exchange filter removed; score only)
+    # Sidebar filters
     min_score = st.sidebar.slider("Min Momentum Score", 0, 100, 50)
 
-    # Fetch ticker data concurrently
+    # --- Diagnostics tracking ---
+    failed_empty_history, failed_short_history, failed_compute, passed_calc = [], [], [], []
+
+    # Fetch + compute (with diagnostics)
     ticker_data = []
     progress = st.progress(0, text="Fetching ticker data...")
     total = len(df)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(build_ticker_row, row["Symbol"], row["YF_Symbol"])
-            for _, row in df.iterrows()
-        ]
+    def _fetch_one(symbol, yf_symbol):
+        # First fetch history so we can categorize failures precisely
+        hist = get_history(yf_symbol, period="3mo")
+        if hist is None or hist.empty:
+            failed_empty_history.append(symbol)
+            return None
+        if len(hist) < 50:
+            failed_short_history.append(symbol)
+            return None
+
+        # Compute momentum and assemble row
+        metrics = calculate_momentum(hist)
+        if not metrics:
+            failed_compute.append(symbol)
+            return None
+
+        current_price = hist["Close"].iloc[-1]
+        five_day_change = ((current_price / hist["Close"].iloc[-5] - 1) * 100) if len(hist) >= 5 else None
+        twenty_day_change = ((current_price / hist["Close"].iloc[-20] - 1) * 100) if len(hist) >= 20 else None
+
+        passed_calc.append(symbol)
+        return {
+            "Symbol": symbol,
+            "Price": round(current_price, 2),
+            "5D_Change": round(five_day_change, 1) if five_day_change is not None else None,
+            "20D_Change": round(twenty_day_change, 1) if twenty_day_change is not None else None,
+            **metrics,
+            "Last_Updated": now_str(),
+            "YF_Symbol": yf_symbol,
+        }
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(_fetch_one, r["Symbol"], r["YF_Symbol"]) for _, r in df.iterrows()]
         for i, fut in enumerate(as_completed(futures)):
             result = fut.result()
             if result:
@@ -236,13 +240,14 @@ def main():
     progress.empty()
 
     results_df = pd.DataFrame(ticker_data)
-    st.session_state["raw_results_df"] = results_df.copy()
+    pre_filter_df = results_df.copy()
 
     if not results_df.empty:
         filtered = results_df[results_df["Momentum_Score"] >= min_score].copy()
     else:
         filtered = pd.DataFrame()
 
+    st.session_state["raw_results_df"] = results_df.copy()
     st.session_state["filtered_results"] = filtered
 
     # Display
@@ -282,6 +287,41 @@ def main():
             symbol_data = filtered[filtered["Symbol"] == selected].iloc[0]
             st.subheader(f"{selected} — Detailed Analysis")
             st.json(symbol_data.to_dict())
+
+    # --- Diagnostics panel ---
+    with st.expander("Diagnostics: where did the rows go?"):
+        total_loaded = len(df_raw)
+        after_clean = len(df)
+        dropped_cleaning = total_loaded - after_clean
+        st.write(f"Loaded rows: **{total_loaded}**")
+        st.write(f"Dropped during cleaning (blank/dup Symbol): **{dropped_cleaning}**")
+        st.write(f"After cleaning: **{after_clean}**")
+
+        st.write("---")
+        st.write(f"Empty history from data source: **{len(failed_empty_history)}**")
+        st.write(f"History < 50 candles: **{len(failed_short_history)}**")
+        st.write(f"Failed during momentum compute: **{len(failed_compute)}**")
+        st.write(f"Computed OK (pre-score): **{len(passed_calc)}**")
+
+        below_score = 0
+        if not pre_filter_df.empty:
+            below_score = (pre_filter_df['Momentum_Score'] < min_score).sum()
+        st.write(f"Below Min Momentum Score ({min_score}): **{below_score}**")
+        st.write(f"Stocks Found (final table): **{len(filtered)}**")
+
+        # Optional previews of dropped tickers
+        preview = []
+        if failed_empty_history:
+            preview.append(pd.DataFrame({"Symbol": failed_empty_history, "Reason": "empty_history"}))
+        if failed_short_history:
+            preview.append(pd.DataFrame({"Symbol": failed_short_history, "Reason": "short_history"}))
+        if failed_compute:
+            preview.append(pd.DataFrame({"Symbol": failed_compute, "Reason": "compute_failed"}))
+        if preview:
+            dropped_df = pd.concat(preview, ignore_index=True)
+            st.dataframe(dropped_df.head(50), use_container_width=True)
+            csv2 = dropped_df.to_csv(index=False)
+            st.download_button("Download dropped list (CSV)", data=csv2, file_name="dropped_tickers.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
