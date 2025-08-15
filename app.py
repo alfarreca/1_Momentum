@@ -1,13 +1,20 @@
+# app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from data_loader import load_excel, get_history, now_str, validate_expected_columns, infer_yf_symbol
+from data_loader import (
+    load_excel,
+    get_history,
+    now_str,
+    validate_expected_columns,
+    infer_yf_symbol,
+)
 
 # ========== APP CONFIG ==========
 MAX_WORKERS = 8
-CACHE_TTL = 3600 * 12  # 12h
+CACHE_TTL = 3600 * 12  # 12 hours
 
 
 def calculate_di_crossovers(hist: pd.DataFrame, period: int = 14):
