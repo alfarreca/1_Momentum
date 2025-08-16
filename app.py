@@ -2,7 +2,6 @@
 # Streamlit app: tolerant XLSX uploader (blank cells & missing columns allowed)
 
 from __future__ import annotations
-
 import io
 import pandas as pd
 import streamlit as st
@@ -85,21 +84,48 @@ st.success("Sheet accepted. You can proceed with blanks or empty columns.")
 st.markdown("### Normalized data (ready for downstream steps)")
 st.dataframe(df, use_container_width=True)
 
-# Optional: Let user download the cleaned/normalized sheet
+# ---- Download buttons (XLSX via openpyxl; fallback to CSV)
 @st.cache_data(show_spinner=False)
-def to_excel_bytes(frame: pd.DataFrame) -> bytes:
+def to_excel_bytes_openpyxl(frame: pd.DataFrame, sheet_name: str) -> bytes:
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-        frame.to_excel(writer, index=False, sheet_name=sheet)
+    # Prefer openpyxl for Streamlit Cloud
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name=sheet_name)
     bio.seek(0)
     return bio.read()
 
-dl = st.download_button(
-    "⬇️ Download normalized sheet (.xlsx)",
-    data=to_excel_bytes(df),
-    file_name=f"normalized_{sheet}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+@st.cache_data(show_spinner=False)
+def to_csv_bytes(frame: pd.DataFrame) -> bytes:
+    return frame.to_csv(index=False).encode("utf-8")
+
+st.markdown("#### Download")
+xlsx_ok = True
+xlsx_bytes = b""
+try:
+    xlsx_bytes = to_excel_bytes_openpyxl(df, sheet)
+except Exception as e:
+    xlsx_ok = False
+    st.warning(
+        "Could not create XLSX (missing `openpyxl` or another writer). "
+        "You can still download CSV below."
+    )
+
+cols = st.columns(2)
+with cols[0]:
+    if xlsx_ok:
+        st.download_button(
+            "⬇️ Download normalized sheet (.xlsx)",
+            data=xlsx_bytes,
+            file_name=f"normalized_{sheet}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+with cols[1]:
+    st.download_button(
+        "⬇️ Download normalized data (.csv)",
+        data=to_csv_bytes(df),
+        file_name=f"normalized_{sheet}.csv",
+        mime="text/csv",
+    )
 
 st.caption(
     "Tip: Keep extra columns if you like (e.g., `Exchange`). "
