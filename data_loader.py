@@ -7,24 +7,21 @@ import pandas as pd
 import pytz
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_exponential
-import streamlit as st  # for cache + warnings
+import streamlit as st
 
-from analysis import calculate_momentum  # no circular import (analysis does not import this module)
+from analysis import calculate_momentum
 
-# ====== CONFIG ======
 MAX_WORKERS = 8
 REQUEST_DELAY = (0.5, 2.0)
 CACHE_TTL = 3600 * 12
 MAX_RETRIES = 3
 TIMEZONE = 'America/New_York'
 
-# yfinance cache folder (optional)
 try:
     yf.set_tz_cache_location("cache")
 except Exception:
     pass
 
-# ---------- Symbol mapping ----------
 def exchange_suffix(ex: str) -> str:
     suffix_map = {
         "ETR": "DE", "EPA": "PA", "LON": "L", "BIT": "MI", "STO": "ST",
@@ -39,7 +36,6 @@ def map_to_yfinance_symbol(symbol: str, exchange: str) -> str:
     suffix = exchange_suffix(exchange)
     return f"{symbol}.{suffix}" if suffix else symbol
 
-# ---------- Robust fetch ----------
 @retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=4, max=10))
 def _safe_yfinance_fetch(ticker, period="3mo"):
     time.sleep(random.uniform(*REQUEST_DELAY))
@@ -47,7 +43,6 @@ def _safe_yfinance_fetch(ticker, period="3mo"):
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_ticker_data(_ticker: str, exchange: str, yf_symbol: str):
-    """Fetch price history, compute indicators, and return one row dict or None."""
     try:
         ticker_obj = yf.Ticker(yf_symbol)
         hist = _safe_yfinance_fetch(ticker_obj)
@@ -76,40 +71,54 @@ def get_ticker_data(_ticker: str, exchange: str, yf_symbol: str):
         st.warning(f"Error processing {_ticker}: {str(e)}")
         return None
 
-def read_uploaded_sheet(uploaded_file) -> pd.DataFrame:
-    """Load and clean the selected sheet; enforce required columns."""
+def read_uploaded_sheet(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
-    return pd.read_excel(xls, sheet_name=sheet_names[0]), sheet_names  # UI will pick later
+    return pd.read_excel(xls, sheet_name=xls.sheet_names[0]), xls.sheet_names
 
-def clean_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-    df["Exchange"] = df["Exchange"].astype(str).str.strip().str.upper()
+def clean_symbols(df: pd.DataFrame):
+    for col in ["Symbol", "Exchange"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().str.upper()
     before = len(df)
-    df = df.dropna(subset=["Symbol", "Exchange"]).drop_duplicates("Symbol")
+    need_cols = [c for c in ["Symbol", "Exchange"] if c in df.columns]
+    df = df.dropna(subset=need_cols).drop_duplicates("Symbol")
     dropped = before - len(df)
     return df, dropped
 
 def enrich_with_yf_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    df["YF_Symbol"] = df.apply(lambda r: map_to_yfinance_symbol(r["Symbol"], r["Exchange"]), axis=1)
+    if "YF_Symbol" not in df.columns:
+        df["YF_Symbol"] = df.apply(lambda r: map_to_yfinance_symbol(str(r["Symbol"]), str(r["Exchange"])), axis=1)
     return df
 
 def fetch_all(df: pd.DataFrame) -> pd.DataFrame:
-    """Parallel fetch across tickers."""
     rows = []
     total = len(df)
+    if total == 0:
+        return pd.DataFrame()
     progress = st.progress(0, text="Fetching ticker data...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
-            executor.submit(get_ticker_data, row["Symbol"], row["Exchange"], row["YF_Symbol"])
+            executor.submit(get_ticker_data, row.get("Symbol",""), row.get("Exchange",""), row.get("YF_Symbol",""))
             for _, row in df.iterrows()
         ]
         for i, f in enumerate(as_completed(futures), start=1):
             data = f.result()
             if data:
+                # Keep original metadata columns if present in input df (Sector/Industry/Country)
+                for meta_col in ["Sector", "Industry", "Country"]:
+                    if meta_col in df.columns:
+                        # Value from the source row by symbol (safe merge later is another option)
+                        pass
                 rows.append(data)
             progress.progress(i / total, text=f"Processed {i}/{total} tickers")
 
     progress.empty()
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+
+    # If the input df had metadata columns, merge them back by Symbol
+    meta_cols = [c for c in ["Sector", "Industry", "Country"] if c in df.columns]
+    if meta_cols:
+        out = out.merge(df[["Symbol"] + meta_cols].drop_duplicates("Symbol"), on="Symbol", how="left")
+
+    return out
