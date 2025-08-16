@@ -8,7 +8,14 @@ from data_loader import (
 from analysis import filter_results
 
 APP_TITLE = "S&P 500 Momentum Scanner (Modularized)"
-EXPECTED_COLUMNS = {"Symbol", "Exchange"}
+REQUIRED_COLUMNS = {"Symbol", "Exchange"}   # Sector/Industry/Country are OPTIONAL
+
+def _multiselect_all(label: str, options: list[str]) -> list[str]:
+    """Multiselect with 'select all' default; returns selected values."""
+    if not options:
+        return []
+    default = options  # select all by default
+    return st.sidebar.multiselect(label, options=options, default=default)
 
 def display_results(filtered_df: pd.DataFrame):
     if filtered_df.empty:
@@ -41,7 +48,7 @@ def main():
 
     uploaded_file = st.file_uploader("Upload Excel file with tickers", type="xlsx")
     if uploaded_file is None:
-        st.info("Please upload a .xlsx file that includes columns: Symbol, Exchange.")
+        st.info("Please upload a .xlsx file that includes at least: Symbol, Exchange. Optional columns: Sector, Industry, Country.")
         st.stop()
 
     # --- Load / pick sheet ---
@@ -52,31 +59,63 @@ def main():
     st.dataframe(df.head(), use_container_width=True)
 
     # --- Validate structure ---
-    if not EXPECTED_COLUMNS.issubset(set(df.columns)):
-        st.error(f"Uploaded sheet must contain these columns: {', '.join(sorted(EXPECTED_COLUMNS))}")
+    if not REQUIRED_COLUMNS.issubset(set(df.columns)):
+        st.error(f"Uploaded sheet must contain these columns: {', '.join(sorted(REQUIRED_COLUMNS))}")
         st.stop()
 
     # --- Clean & map ---
     df, dropped = clean_symbols(df)
     if dropped:
         st.caption(f"Dropped {dropped} rows after cleaning (NaN/duplicates).")
-    df = enrich_with_yf_symbols(df)
 
-    # --- Sidebar filters ---
-    exchanges = sorted(df["Exchange"].unique().tolist())
+    # ===== Sidebar: pre-fetch filters to reduce API calls =====
+    st.sidebar.header("Pre-Fetch Filters")
+    # Build lists safely (ignore NaN)
+    sector_opts   = sorted([s for s in df.get("Sector", pd.Series(dtype=str)).dropna().unique().tolist()])
+    industry_opts = sorted([s for s in df.get("Industry", pd.Series(dtype=str)).dropna().unique().tolist()])
+    country_opts  = sorted([s for s in df.get("Country", pd.Series(dtype=str)).dropna().unique().tolist()])
+
+    # Only show filter if column exists; otherwise skip
+    selected_sectors   = _multiselect_all("Sector", sector_opts) if "Sector" in df.columns else []
+    selected_industry  = _multiselect_all("Industry", industry_opts) if "Industry" in df.columns else []
+    selected_countries = _multiselect_all("Country", country_opts) if "Country" in df.columns else []
+
+    # Apply pre-fetch subset
+    prefetch_df = df.copy()
+    if selected_sectors and "Sector" in prefetch_df.columns:
+        prefetch_df = prefetch_df[prefetch_df["Sector"].isin(selected_sectors)]
+    if selected_industry and "Industry" in prefetch_df.columns:
+        prefetch_df = prefetch_df[prefetch_df["Industry"].isin(selected_industry)]
+    if selected_countries and "Country" in prefetch_df.columns:
+        prefetch_df = prefetch_df[prefetch_df["Country"].isin(selected_countries)]
+
+    # Map to YF symbols after narrowing
+    prefetch_df = enrich_with_yf_symbols(prefetch_df)
+
+    # ===== Sidebar: post-fetch filters =====
+    st.sidebar.header("Post-Fetch Filters")
+    exchanges = sorted(prefetch_df["Exchange"].unique().tolist())
     selected_exchange = st.sidebar.selectbox("Exchange", ["All"] + exchanges, index=0)
     min_score = st.sidebar.slider("Min Momentum Score", 0, 100, 50, step=5)
 
     # --- Fetch & compute ---
-    results_df = fetch_all(df)
+    results_df = fetch_all(prefetch_df)
     st.session_state["raw_results_df"] = results_df.copy()
 
-    # --- Filter & show ---
-    filtered = filter_results(results_df, min_score=min_score, exchange=selected_exchange)
+    # --- Post-fetch filtering (includes Sector / Industry / Country again for safety) ---
+    filtered = filter_results(
+        results_df,
+        min_score=min_score,
+        exchange=selected_exchange,
+        sectors=selected_sectors if selected_sectors else None,
+        industries=selected_industry if selected_industry else None,
+        countries=selected_countries if selected_countries else None,
+    )
     st.session_state["filtered_results"] = filtered
+
+    # --- Display & export ---
     display_results(filtered)
 
-    # --- Download & detail view ---
     if not filtered.empty:
         csv = filtered.to_csv(index=False)
         st.download_button(
