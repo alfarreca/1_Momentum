@@ -1,328 +1,107 @@
 # app.py
-import streamlit as st
-import numpy as np
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# Streamlit app: tolerant XLSX uploader (blank cells & missing columns allowed)
 
-from data_loader import (
-    validate_expected_columns,
-    infer_yf_symbol,
-    get_history,
-    now_str,
+from __future__ import annotations
+
+import io
+import pandas as pd
+import streamlit as st
+
+from data_loader import validate_expected_columns, clean_symbols, EXPECTED_COLS
+
+st.set_page_config(page_title="Momentum Sheet Loader", layout="wide")
+
+# ---- UI: Header / Cache
+st.title("📈 Momentum – Sheet Uploader (tolerant)")
+
+left, right = st.columns([1, 5])
+with left:
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared.")
+
+st.caption(
+    "Upload an **.xlsx** file. Missing columns will be auto-created as empty. "
+    "Only **Symbol** is required; all other fields can be blank."
 )
 
-# ========== APP CONFIG ==========
-MAX_WORKERS = 8
-CACHE_TTL = 3600 * 12  # 12 hours
+# ---- File uploader
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=False)
 
+@st.cache_data(show_spinner=False)
+def read_xlsx_return_sheets(file_bytes: bytes):
+    x = pd.ExcelFile(io.BytesIO(file_bytes))
+    return x.sheet_names
 
-def calculate_di_crossovers(hist: pd.DataFrame, period: int = 14):
-    high = hist["High"]
-    low = hist["Low"]
-    close = hist["Close"]
+@st.cache_data(show_spinner=False)
+def read_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
 
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0)
+if uploaded is None:
+    st.info("Waiting for an .xlsx file…")
+    st.stop()
 
-    tr = np.maximum.reduce(
-        [
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
-        ]
-    )
-    atr = pd.Series(tr).rolling(window=period, min_periods=period).mean()
+# List sheets to choose from
+try:
+    sheet_names = read_xlsx_return_sheets(uploaded.getvalue())
+except Exception as e:
+    st.error(f"Could not open Excel file: {e}")
+    st.stop()
 
-    plus_di = 100 * pd.Series(plus_dm).rolling(window=period).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm).rolling(window=period).mean() / atr
+sheet = st.selectbox("Select sheet to analyze", options=sheet_names, index=0)
 
-    bullish_crossover = (plus_di > minus_di) & (plus_di.shift(1) <= minus_di.shift(1))
-    bearish_crossover = (minus_di > plus_di) & (minus_di.shift(1) <= plus_di.shift(1))
-    return plus_di, minus_di, bullish_crossover, bearish_crossover
+# ---- Read selected sheet
+try:
+    df_raw = read_sheet(uploaded.getvalue(), sheet)
+except Exception as e:
+    st.error(f"Failed to read sheet: {e}")
+    st.stop()
 
+st.markdown("### Loaded preview")
+st.dataframe(df_raw.head(20), use_container_width=True)
 
-def calculate_momentum(hist: pd.DataFrame):
-    if hist.empty or len(hist) < 50:
-        return None
+# ---- Tolerant schema handling
+try:
+    df = validate_expected_columns(df_raw)
+    df, dropped = clean_symbols(df)
+except Exception as e:
+    st.error(f"Validation failed: {e}")
+    st.stop()
 
-    close = hist["Close"]
-    high = hist["High"]
-    low = hist["Low"]
-    volume = hist["Volume"]
-
-    ema20 = close.ewm(span=20).mean().iloc[-1]
-    ema50 = close.ewm(span=50).mean().iloc[-1]
-    ema200 = close.ewm(span=200).mean().iloc[-1]
-
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14).mean().iloc[-1]
-    avg_loss = loss.ewm(alpha=1 / 14).mean().iloc[-1]
-    rs = avg_gain / avg_loss if avg_loss != 0 else 100
-    rsi = 100 - (100 / (1 + rs))
-
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9).mean()
-    macd_hist = macd.iloc[-1] - macd_signal.iloc[-1]
-    macd_line_above_signal = macd.iloc[-1] > macd_signal.iloc[-1]
-
-    vol_avg_20 = volume.rolling(20).mean().iloc[-1]
-    volume_ratio = volume.iloc[-1] / vol_avg_20 if vol_avg_20 != 0 else 1
-
-    tr = pd.concat(
-        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(14).mean()
-
-    plus_dm = high.diff().where(lambda x: (x > 0) & (x > low.diff().abs()), 0)
-    minus_dm = (-low.diff()).where(lambda x: (x > 0) & (x > high.diff().abs()), 0)
-    plus_di = 100 * (plus_dm.rolling(14).sum() / atr)
-    minus_di = 100 * (minus_dm.rolling(14).sum() / atr)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx = dx.rolling(14).mean().iloc[-1] if not dx.isnull().all() else float("nan")
-
-    plus_di_c, minus_di_c, bull_x, bear_x = calculate_di_crossovers(hist)
-    last_bullish = bool(bull_x.iloc[-1])
-    last_bearish = bool(bear_x.iloc[-1])
-
-    score = 0
-    if close.iloc[-1] > ema20 > ema50 > ema200:
-        score += 30
-    elif close.iloc[-1] > ema50 > ema200:
-        score += 20
-    elif close.iloc[-1] > ema200:
-        score += 10
-
-    if 60 <= rsi < 80:
-        score += 20
-    elif 50 <= rsi < 60 or 80 <= rsi <= 90:
-        score += 10
-
-    if macd_hist > 0 and macd_line_above_signal:
-        score += 15
-
-    if volume_ratio > 1.5:
-        score += 15
-    elif volume_ratio > 1.2:
-        score += 10
-
-    if adx > 30:
-        score += 20
-    elif adx > 25:
-        score += 15
-    elif adx > 20:
-        score += 10
-
-    if last_bullish:
-        score += 10
-    if last_bearish:
-        score -= 10
-
-    score = max(0, min(100, score))
-    return {
-        "EMA20": round(ema20, 2),
-        "EMA50": round(ema50, 2),
-        "EMA200": round(ema200, 2),
-        "RSI": round(rsi, 1),
-        "MACD_Hist": round(macd_hist, 3),
-        "ADX": round(adx, 1) if not np.isnan(adx) else None,
-        "Volume_Ratio": round(volume_ratio, 2),
-        "Momentum_Score": score,
-        "Trend": "↑ Strong"
-        if score >= 80
-        else "↑ Medium"
-        if score >= 60
-        else "↗ Weak"
-        if score >= 40
-        else "→ Neutral",
-        "Bullish_Crossover": last_bullish,
-        "Bearish_Crossover": last_bearish,
-        "plus_di_last": round(plus_di_c.iloc[-1], 1) if not np.isnan(plus_di_c.iloc[-1]) else None,
-        "minus_di_last": round(minus_di_c.iloc[-1], 1) if not np.isnan(minus_di_c.iloc[-1]) else None,
-    }
-
-
-def main():
-    st.set_page_config(page_title="S&P 500 Momentum Scanner", layout="wide")
-    st.title("S&P 500 Momentum Scanner")
-
-    # Optional: a quick cache clear to ensure apples-to-apples comparisons
-    if st.sidebar.button("Clear cache"):
-        st.cache_data.clear()
-
-    uploaded_file = st.file_uploader("Upload Excel file with tickers", type="xlsx")
-    if uploaded_file is None:
-        st.warning("Please upload a .xlsx file with your tickers.")
-        st.stop()
-
-    # Let user pick sheet visually
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
-    selected_sheet = st.selectbox("Select sheet to analyze", sheet_names, index=0)
-
-    df_raw = pd.read_excel(xls, sheet_name=selected_sheet)
-    st.write(f"Loaded rows from '{selected_sheet}': **{len(df_raw)}**")
-    st.dataframe(df_raw.head())
-
-    # Validate required columns, clean, and preserve any extra columns (e.g., Exchange)
-    try:
-        validate_expected_columns(df_raw)
-        df = df_raw.copy()
-        df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-        before = len(df)
-        df = df.dropna(subset=["Symbol"]).drop_duplicates("Symbol")
-        st.write(f"Dropped rows: **{before - len(df)}** after cleaning.")
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    # Build YF_Symbol like the original app WHEN an Exchange column exists; otherwise fall back to Symbol
-    if "Exchange" in df.columns:
-        df["YF_Symbol"] = df.apply(lambda r: infer_yf_symbol(r["Symbol"], r["Exchange"]), axis=1)
-    else:
-        df["YF_Symbol"] = df["Symbol"]
-
-    # Sidebar filters
-    min_score = st.sidebar.slider("Min Momentum Score", 0, 100, 50)
-
-    # --- Diagnostics tracking ---
-    failed_empty_history, failed_short_history, failed_compute, passed_calc = [], [], [], []
-
-    # Fetch + compute (with diagnostics)
-    ticker_data = []
-    progress = st.progress(0, text="Fetching ticker data...")
-    total = len(df)
-
-    def _fetch_one(symbol, yf_symbol):
-        # First fetch history so we can categorize failures precisely
-        hist = get_history(yf_symbol, period="3mo")
-        if hist is None or hist.empty:
-            failed_empty_history.append(symbol)
-            return None
-        if len(hist) < 50:
-            failed_short_history.append(symbol)
-            return None
-
-        # Compute momentum and assemble row
-        metrics = calculate_momentum(hist)
-        if not metrics:
-            failed_compute.append(symbol)
-            return None
-
-        current_price = hist["Close"].iloc[-1]
-        five_day_change = ((current_price / hist["Close"].iloc[-5] - 1) * 100) if len(hist) >= 5 else None
-        twenty_day_change = ((current_price / hist["Close"].iloc[-20] - 1) * 100) if len(hist) >= 20 else None
-
-        passed_calc.append(symbol)
-        return {
-            "Symbol": symbol,
-            "Price": round(current_price, 2),
-            "5D_Change": round(five_day_change, 1) if five_day_change is not None else None,
-            "20D_Change": round(twenty_day_change, 1) if twenty_day_change is not None else None,
-            **metrics,
-            "Last_Updated": now_str(),
-            "YF_Symbol": yf_symbol,
-        }
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(_fetch_one, r["Symbol"], r["YF_Symbol"]) for _, r in df.iterrows()]
-        for i, fut in enumerate(as_completed(futures)):
-            result = fut.result()
-            if result:
-                ticker_data.append(result)
-            progress.progress((i + 1) / total, text=f"Processed {i + 1}/{total} tickers")
-    progress.empty()
-
-    results_df = pd.DataFrame(ticker_data)
-    pre_filter_df = results_df.copy()
-
-    if not results_df.empty:
-        filtered = results_df[results_df["Momentum_Score"] >= min_score].copy()
-    else:
-        filtered = pd.DataFrame()
-
-    st.session_state["raw_results_df"] = results_df.copy()
-    st.session_state["filtered_results"] = filtered
-
-    # Display
-    st.metric("Stocks Found", len(filtered))
-    if not filtered.empty and "Momentum_Score" in filtered:
-        st.metric("Avg Momentum Score", round(filtered["Momentum_Score"].mean(), 1))
-
-    st.dataframe(
-        filtered.sort_values("Momentum_Score", ascending=False),
-        use_container_width=True,
-        height=600,
+# ---- Report what we did
+missing_cols = [c for c in EXPECTED_COLS if c not in df_raw.columns]
+if missing_cols:
+    st.warning(
+        "Missing columns were auto-created as empty: "
+        + ", ".join(missing_cols)
     )
 
-    # Download results
-    if not filtered.empty:
-        csv = filtered.to_csv(index=False)
-        st.download_button(
-            "Download Filtered Results as CSV",
-            data=csv,
-            file_name="momentum_scanner_results.csv",
-            mime="text/csv",
-        )
+if dropped > 0:
+    st.info(f"Dropped **{dropped}** rows with empty/invalid `Symbol`.")
 
-        # Symbol details
-        symbol_options = ["— Select a symbol —"] + filtered["Symbol"].tolist()
-        last_selected = st.session_state.get("symbol_select", symbol_options[0])
-        if last_selected not in symbol_options:
-            last_selected = symbol_options[0]
+st.success("Sheet accepted. You can proceed with blanks or empty columns.")
 
-        selected = st.selectbox(
-            "Select a symbol for details",
-            options=symbol_options,
-            index=symbol_options.index(last_selected),
-            key="symbol_select",
-        )
-        if selected != symbol_options[0]:
-            symbol_data = filtered[filtered["Symbol"] == selected].iloc[0]
-            st.subheader(f"{selected} — Detailed Analysis")
-            st.json(symbol_data.to_dict())
+# ---- Show the normalized, ready-to-use table
+st.markdown("### Normalized data (ready for downstream steps)")
+st.dataframe(df, use_container_width=True)
 
-    # --- Diagnostics panel ---
-    with st.expander("Diagnostics: where did the rows go?"):
-        total_loaded = len(df_raw)
-        after_clean = len(df)
-        dropped_cleaning = total_loaded - after_clean
-        st.write(f"Loaded rows: **{total_loaded}**")
-        st.write(f"Dropped during cleaning (blank/dup Symbol): **{dropped_cleaning}**")
-        st.write(f"After cleaning: **{after_clean}**")
+# Optional: Let user download the cleaned/normalized sheet
+@st.cache_data(show_spinner=False)
+def to_excel_bytes(frame: pd.DataFrame) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+        frame.to_excel(writer, index=False, sheet_name=sheet)
+    bio.seek(0)
+    return bio.read()
 
-        st.write("---")
-        st.write(f"Empty history from data source: **{len(failed_empty_history)}**")
-        st.write(f"History < 50 candles: **{len(failed_short_history)}**")
-        st.write(f"Failed during momentum compute: **{len(failed_compute)}**")
-        st.write(f"Computed OK (pre-score): **{len(passed_calc)}**")
+dl = st.download_button(
+    "⬇️ Download normalized sheet (.xlsx)",
+    data=to_excel_bytes(df),
+    file_name=f"normalized_{sheet}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
-        below_score = 0
-        if not pre_filter_df.empty:
-            below_score = (pre_filter_df['Momentum_Score'] < min_score).sum()
-        st.write(f"Below Min Momentum Score ({min_score}): **{below_score}**")
-        st.write(f"Stocks Found (final table): **{len(filtered)}**")
-
-        # Optional previews of dropped tickers
-        preview = []
-        if failed_empty_history:
-            preview.append(pd.DataFrame({"Symbol": failed_empty_history, "Reason": "empty_history"}))
-        if failed_short_history:
-            preview.append(pd.DataFrame({"Symbol": failed_short_history, "Reason": "short_history"}))
-        if failed_compute:
-            preview.append(pd.DataFrame({"Symbol": failed_compute, "Reason": "compute_failed"}))
-        if preview:
-            dropped_df = pd.concat(preview, ignore_index=True)
-            st.dataframe(dropped_df.head(50), use_container_width=True)
-            csv2 = dropped_df.to_csv(index=False)
-            st.download_button("Download dropped list (CSV)", data=csv2, file_name="dropped_tickers.csv", mime="text/csv")
-
-
-if __name__ == "__main__":
-    main()
+st.caption(
+    "Tip: Keep extra columns if you like (e.g., `Exchange`). "
+    "They will be preserved alongside the expected schema."
+)
