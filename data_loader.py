@@ -1,71 +1,74 @@
 # data_loader.py
-import time, random
-from datetime import datetime
-from typing import Optional, Tuple
+# Tolerant schema utilities for the Streamlit uploader flow.
 
+from __future__ import annotations
 import pandas as pd
-import pytz
-import yfinance as yf
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-REQUEST_DELAY: Tuple[float, float] = (0.5, 2.0)
-MAX_RETRIES = 3
-TIMEZONE = "America/New_York"
+# Expected schema (order is preserved when displaying)
+EXPECTED_COLS = [
+    "Symbol",
+    "Name",
+    "Sector",
+    "Industry",
+    "Theme",
+    "Country",
+    "Notes",
+    "Asset_Type",
+]
 
-yf.set_tz_cache_location("cache")
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip whitespace and standardize column names to our canon."""
+    canon = {c.lower().strip(): c for c in EXPECTED_COLS}
 
-# Exchange → Yahoo suffix map
-SUFFIX_MAP = {
-    "ETR":"DE","EPA":"PA","LON":"L","BIT":"MI","STO":"ST","SWX":"SW",
-    "TSE":"TO","TSX":"TO","TSXV":"V","ASX":"AX","HKG":"HK","CNY":"SS","TORONTO":"TO",
-    # common variants
-    "NYQ":"","NYS":"","NYSE":"","NMS":"","NASD":"","NASDAQ":"",
-    "LSE":"L","PAR":"PA","FRA":"F","CCC":"","SHH":"SS","SHZ":"SZ"
-}
+    new_cols = []
+    for c in df.columns:
+        key = str(c).lower().strip()
+        # If it exactly matches one of our expected names (case/space-insensitive),
+        # map it back to the canonical casing; else keep original.
+        new_cols.append(canon.get(key, str(c).strip()))
+    out = df.copy()
+    out.columns = new_cols
+    return out
 
-def validate_expected_columns(df: pd.DataFrame) -> None:
-    expected = {"Symbol","Name","Sector","Industry","Theme","Country","Notes","Asset_Type"}
-    missing = expected.difference(df.columns)
-    if missing:
-        raise ValueError(
-            f"Uploaded sheet must contain: {', '.join(sorted(expected))}. "
-            f"Missing: {', '.join(sorted(missing))}"
-        )
+def validate_expected_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make the dataframe schema tolerant:
+      - Normalize column names (strip spaces, restore canonical names).
+      - Auto-create any missing EXPECTED_COLS as empty columns.
+      - Keep any extra columns untouched (e.g., Exchange).
+      - Do NOT error on missing/blank values.
+    Returns a COPY of df with ensured columns in a readable order.
+    """
+    out = _normalize_columns(df)
 
-def load_excel(uploaded_file) -> pd.DataFrame:
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
-    df = pd.read_excel(xls, sheet_name=sheet_names[0])
-    validate_expected_columns(df)
-    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
-    before = len(df)
-    df = df.dropna(subset=["Symbol"]).drop_duplicates("Symbol")
-    df.attrs["sheet_names"] = sheet_names
-    df.attrs["loaded_rows"] = before
-    return df
+    # Add any missing columns as empty (None) with same index length
+    missing = [c for c in EXPECTED_COLS if c not in out.columns]
+    for c in missing:
+        out[c] = pd.Series([None] * len(out), index=out.index)
 
-def infer_yf_symbol(symbol: str, exchange: Optional[str]) -> str:
-    # if already YF-formatted (e.g., DPM.TO or ETH-USD), keep it
-    if "." in symbol or "-" in symbol:
-        return symbol
-    if exchange:
-        suf = SUFFIX_MAP.get(str(exchange).upper(), "")
-        return f"{symbol}.{suf}" if suf else symbol
-    return symbol
+    # Reorder so expected columns come first (in EXPECTED_COLS order), extras follow
+    extras = [c for c in out.columns if c not in EXPECTED_COLS]
+    out = out[EXPECTED_COLS + extras]
 
-@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=4, max=10))
-def _safe_yfinance_history(yf_symbol: str, period: str = "3mo") -> pd.DataFrame:
-    time.sleep(random.uniform(*REQUEST_DELAY))
-    return yf.Ticker(yf_symbol).history(period=period)
+    return out
 
-def get_history(yf_symbol: str, period: str = "3mo") -> Optional[pd.DataFrame]:
-    try:
-        hist = _safe_yfinance_history(yf_symbol, period=period)
-        if hist is None or hist.empty:
-            return None
-        return hist
-    except Exception:
-        return None
+def clean_symbols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize the Symbol column and drop unusable rows.
+    Keeps everything else (including blanks).
+    """
+    out = df.copy()
+    out["Symbol"] = (
+        out["Symbol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"NAN": ""})  # handle stringified NaNs
+    )
 
-def now_str() -> str:
-    return datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    before = len(out)
+    # Drop rows where Symbol is empty after cleaning
+    out = out[out["Symbol"] != ""]
+    dropped = before - len(out)
+
+    return out, dropped
