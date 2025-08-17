@@ -11,7 +11,6 @@ APP_TITLE = "S&P 500 Momentum Scanner (Modularized)"
 REQUIRED_COLUMNS = {"Symbol", "Exchange"}   # Sector/Industry/Country are OPTIONAL
 
 def _multiselect_all(label: str, options: list[str]) -> list[str]:
-    """Multiselect with 'select all' default; returns selected values."""
     if not options:
         return []
     default = options  # select all by default
@@ -32,13 +31,50 @@ def display_results(filtered_df: pd.DataFrame):
         height=600
     )
 
+def _render_score_breakdown(row: pd.Series):
+    # Prefer the nested Score_Breakdown dict if present
+    breakdown = row.get("Score_Breakdown", None)
+    if isinstance(breakdown, dict):
+        # Convert to a simple table: Component | Points | Rule
+        records = []
+        for key in ["EMA_Alignment", "RSI", "MACD", "Volume", "ADX", "DI_Crossover"]:
+            item = breakdown.get(key, {})
+            records.append({
+                "Component": key,
+                "Points": item.get("points", 0),
+                "Rule": item.get("rule", "")
+            })
+        df_bd = pd.DataFrame(records)
+        st.subheader("Score Breakdown")
+        st.table(df_bd)
+        return
+
+    # Fallback to flat fields
+    fields = [
+        ("EMA_Alignment", row.get("Score_EMA", 0), row.get("Rule_EMA", "")),
+        ("RSI",           row.get("Score_RSI", 0), row.get("Rule_RSI", "")),
+        ("MACD",          row.get("Score_MACD", 0), row.get("Rule_MACD", "")),
+        ("Volume",        row.get("Score_Volume", 0), row.get("Rule_Volume", "")),
+        ("ADX",           row.get("Score_ADX", 0), row.get("Rule_ADX", "")),
+        ("DI_Crossover",  row.get("Score_DI", 0), row.get("Rule_DI", "")),
+    ]
+    df_bd = pd.DataFrame(fields, columns=["Component", "Points", "Rule"])
+    st.subheader("Score Breakdown")
+    st.table(df_bd)
+
 def display_symbol_details(filtered_df: pd.DataFrame, selected_symbol: str | None):
     if not selected_symbol:
         return
     try:
         row = filtered_df[filtered_df["Symbol"] == selected_symbol].iloc[0]
         st.subheader(f"{selected_symbol} — Detailed Snapshot")
+
+        # 1) Quick breakdown table (new)
+        _render_score_breakdown(row)
+
+        # 2) Full JSON (unchanged, includes all raw fields + breakdown)
         st.json(row.to_dict())
+
     except Exception as e:
         st.error(f"Error loading {selected_symbol}: {str(e)}")
 
@@ -70,17 +106,14 @@ def main():
 
     # ===== Sidebar: pre-fetch filters to reduce API calls =====
     st.sidebar.header("Pre-Fetch Filters")
-    # Build lists safely (ignore NaN)
     sector_opts   = sorted([s for s in df.get("Sector", pd.Series(dtype=str)).dropna().unique().tolist()])
     industry_opts = sorted([s for s in df.get("Industry", pd.Series(dtype=str)).dropna().unique().tolist()])
     country_opts  = sorted([s for s in df.get("Country", pd.Series(dtype=str)).dropna().unique().tolist()])
 
-    # Only show filter if column exists; otherwise skip
     selected_sectors   = _multiselect_all("Sector", sector_opts) if "Sector" in df.columns else []
     selected_industry  = _multiselect_all("Industry", industry_opts) if "Industry" in df.columns else []
     selected_countries = _multiselect_all("Country", country_opts) if "Country" in df.columns else []
 
-    # Apply pre-fetch subset
     prefetch_df = df.copy()
     if selected_sectors and "Sector" in prefetch_df.columns:
         prefetch_df = prefetch_df[prefetch_df["Sector"].isin(selected_sectors)]
@@ -89,7 +122,6 @@ def main():
     if selected_countries and "Country" in prefetch_df.columns:
         prefetch_df = prefetch_df[prefetch_df["Country"].isin(selected_countries)]
 
-    # Map to YF symbols after narrowing
     prefetch_df = enrich_with_yf_symbols(prefetch_df)
 
     # ===== Sidebar: post-fetch filters =====
@@ -102,7 +134,6 @@ def main():
     results_df = fetch_all(prefetch_df)
     st.session_state["raw_results_df"] = results_df.copy()
 
-    # --- Post-fetch filtering (includes Sector / Industry / Country again for safety) ---
     filtered = filter_results(
         results_df,
         min_score=min_score,
