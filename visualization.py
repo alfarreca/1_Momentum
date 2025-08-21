@@ -19,11 +19,11 @@ REQUIRED_COLUMNS = {"Symbol", "Exchange"}   # Other metadata columns are optiona
 # -----------------------
 # Small UI helpers
 # -----------------------
-def _multiselect_all(label: str, options: List[str]) -> List[str]:
+def _multiselect_all(label: str, options: List[str], key: str | None = None) -> List[str]:
     if not options:
         return []
     default = options  # select all by default
-    return st.multiselect(label, options=options, default=default)
+    return st.multiselect(label, options=options, default=default, key=key)
 
 
 def _render_score_breakdown(row: pd.Series):
@@ -57,7 +57,9 @@ def _download_xlsx_button(df: pd.DataFrame, label: str = "Download Excel"):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Results")
-    st.download_button(label, data=output.getvalue(), file_name="momentum_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(label, data=output.getvalue(),
+                       file_name="momentum_results.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def _apply_prefetch_filters(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,7 +68,7 @@ def _apply_prefetch_filters(df: pd.DataFrame) -> pd.DataFrame:
     with st.expander("Prefetch filters (apply before downloading market data)"):
         # Exchange
         ex_options = ["All"] + sorted(x for x in out["Exchange"].dropna().unique() if x != "")
-        ex_selected = st.selectbox("Exchange", options=ex_options, index=0)
+        ex_selected = st.selectbox("Exchange", options=ex_options, index=0, key="pre_exchange")
         if ex_selected != "All":
             out = out[out["Exchange"] == ex_selected]
 
@@ -75,7 +77,7 @@ def _apply_prefetch_filters(df: pd.DataFrame) -> pd.DataFrame:
             if col in out.columns:
                 opts = sorted(out[col].dropna().astype(str).unique())
                 if opts:
-                    selected = st.multiselect(col, options=opts, default=opts)
+                    selected = st.multiselect(col, options=opts, default=opts, key=f"pre_{col.lower()}")
                     out = out[out[col].isin(selected)]
     return out
 
@@ -102,7 +104,7 @@ def main():
     st.markdown(
         """
         <style>
-        /* try to enforce dark-ish vibes regardless of theme */
+        /* dark theme-ish */
         .stApp { background-color: #0e1117; color: #e5e7eb; }
         .stMarkdown, .stDataFrame, .stSelectbox, .stMultiSelect, .stButton, .stDownloadButton, .stText { color: #e5e7eb; }
         div[data-testid="stTable"], div[data-testid="stDataFrame"] { background-color: #111827; }
@@ -137,7 +139,7 @@ def main():
         st.stop()
 
     # 4) Fetch button to avoid unnecessary API calls
-    if st.button("Fetch data", type="primary"):
+    if st.button("Fetch data", type="primary", key="btn_fetch"):
         results_df = fetch_all(prefetch_df)
 
         if results_df.empty:
@@ -146,12 +148,20 @@ def main():
 
         # 5) Post-fetch filtering & display
         with st.expander("Post-fetch filters (score & metadata)"):
-            min_score = st.slider("Minimum Momentum Score", 0, 100, 60, 5)
+            min_score = st.slider("Minimum Momentum Score", 0, 100, 60, 5, key="post_min_score")
             ex_post = ["All"] + sorted(results_df["Exchange"].dropna().unique().tolist())
-            ex_selected = st.selectbox("Exchange (post)", options=ex_post, index=0)
+            ex_selected = st.selectbox("Exchange (post)", options=ex_post, index=0, key="post_exchange")
             sectors = _multiselect_all("Sector", sorted(results_df["Sector"].dropna().unique())) if "Sector" in results_df.columns else []
             industries = _multiselect_all("Industry", sorted(results_df["Industry"].dropna().unique())) if "Industry" in results_df.columns else []
             countries = _multiselect_all("Country", sorted(results_df["Country"].dropna().unique())) if "Country" in results_df.columns else []
+
+            # Assign explicit keys to avoid duplicates with Prefetch widgets
+            if "Sector" in results_df.columns:
+                sectors = _multiselect_all("Sector", sorted(results_df["Sector"].dropna().unique()), key="post_sector")
+            if "Industry" in results_df.columns:
+                industries = _multiselect_all("Industry", sorted(results_df["Industry"].dropna().unique()), key="post_industry")
+            if "Country" in results_df.columns:
+                countries = _multiselect_all("Country", sorted(results_df["Country"].dropna().unique()), key="post_country")
 
         filtered = filter_results(
             results_df,
@@ -170,18 +180,10 @@ def main():
 
         # 6) Symbol details
         symbol_options = ["(choose)"] + filtered["Symbol"].astype(str).tolist()
-        last_selected = st.session_state.get("last_symbol", symbol_options[0])
-        if last_selected not in symbol_options:
-            last_selected = symbol_options[0]
-
-        selected = st.selectbox(
-            "Select a symbol for details",
-            options=symbol_options,
-            index=symbol_options.index(last_selected),
-            key="symbol_select"
-        )
-        if selected != symbol_options[0]:
+        selected = st.selectbox("Select a symbol for details", options=symbol_options, index=0, key="post_symbol_select")
+        if selected != "(choose)":
             display_symbol_details(filtered, selected)
+
 
 if __name__ == "__main__":
     main()
