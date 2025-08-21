@@ -1,124 +1,231 @@
 # data_loader.py
-import time, random
+from __future__ import annotations
+
+import time
+import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import pytz
 import yfinance as yf
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import streamlit as st
 
 from analysis import calculate_momentum
 
+# -----------------------
+# Config
+# -----------------------
 MAX_WORKERS = 8
-REQUEST_DELAY = (0.5, 2.0)
-CACHE_TTL = 3600 * 12
-MAX_RETRIES = 3
-TIMEZONE = 'America/New_York'
+REQUEST_DELAY = (0.3, 1.0)
+CACHE_TTL = 3600 * 6  # 6 hours
 
-try:
-    yf.set_tz_cache_location("cache")
-except Exception:
-    pass
 
-def exchange_suffix(ex: str) -> str:
-    suffix_map = {
-        "ETR": "DE", "EPA": "PA", "LON": "L", "BIT": "MI", "STO": "ST",
-        "SWX": "SW", "TSE": "TO", "TSX": "TO", "TSXV": "V", "ASX": "AX",
-        "HKG": "HK", "CNY": "SS", "TORONTO": "TO"
-    }
-    return suffix_map.get(ex.upper(), "")
+# -----------------------
+# Helpers
+# -----------------------
+EX_SUFFIX = {
+    # Americas
+    "NYSE": "", "NYS": "", "NYQ": "", "NASDAQ": "", "NMS": "", "NCM": "", "ASE": "",
+    "TSX": ".TO", "TSXV": ".V",
+    # Europe majors
+    "LSE": ".L", "LON": ".L",
+    "XETRA": ".DE", "XETR": ".DE", "FRA": ".F",
+    "PAR": ".PA", "EPA": ".PA",
+    "MIL": ".MI", "BIT": ".MI",
+    "AMS": ".AS", "AEX": ".AS",
+    "BRU": ".BR",
+    "LIS": ".LS",
+    "MAD": ".MC",
+    "VIE": ".VI",
+    "SIX": ".SW", "ZRH": ".SW",
+    "STO": ".ST", "HEL": ".HE", "CPH": ".CO", "OSL": ".OL",
+    # Asia-Pac
+    "TSE": ".T", "TYO": ".T",
+    "HKEX": ".HK",
+    "ASX": ".AX",
+    "SGX": ".SI",
+    "KOSPI": ".KS", "KSE": ".KS", "KOSDAQ": ".KQ",
+}
 
-def map_to_yfinance_symbol(symbol: str, exchange: str) -> str:
-    if exchange.upper() in ["NYSE", "NASDAQ"]:
-        return symbol
-    suffix = exchange_suffix(exchange)
-    return f"{symbol}.{suffix}" if suffix else symbol
+def _map_to_yf_symbol(symbol: str, exchange: str | None, existing: str | None) -> str:
+    """Return the Yahoo Finance symbol to use."""
+    if existing and isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    sx = (exchange or "").upper().strip()
+    suffix = EX_SUFFIX.get(sx, "")
+    sym = (symbol or "").strip()
+    return f"{sym}{suffix}" if suffix and not sym.endswith(suffix) else sym
 
-@retry(stop=stop_after_attempt(MAX_RETRIES), wait=wait_exponential(multiplier=1, min=4, max=10))
-def _safe_yfinance_fetch(ticker, period="3mo"):
-    time.sleep(random.uniform(*REQUEST_DELAY))
-    return ticker.history(period=period)
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_ticker_data(_ticker: str, exchange: str, yf_symbol: str):
+# -----------------------
+# IO / Cleaning
+# -----------------------
+def read_uploaded_sheet() -> Optional[pd.DataFrame]:
+    st.sidebar.subheader("Upload watchlist")
+    file = st.sidebar.file_uploader("Upload XLSX/CSV with at least 'Symbol' and 'Exchange'", type=["xlsx", "csv"])
+    if not file:
+        return None
     try:
-        ticker_obj = yf.Ticker(yf_symbol)
-        hist = _safe_yfinance_fetch(ticker_obj)
-        if hist.empty or len(hist) < 50:
-            return None
-
-        momentum_data = calculate_momentum(hist)
-        if not momentum_data:
-            return None
-
-        current_price = hist['Close'].iloc[-1]
-        five_day_change = ((current_price / hist['Close'].iloc[-5] - 1) * 100) if len(hist) >= 5 else None
-        twenty_day_change = ((current_price / hist['Close'].iloc[-20] - 1) * 100) if len(hist) >= 20 else None
-
-        return {
-            "Symbol": _ticker,
-            "Exchange": exchange,
-            "Price": round(current_price, 2),
-            "5D_Change": round(five_day_change, 1) if five_day_change is not None else None,
-            "20D_Change": round(twenty_day_change, 1) if twenty_day_change is not None else None,
-            **momentum_data,
-            "Last_Updated": datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M"),
-            "YF_Symbol": yf_symbol,
-        }
+        if file.name.lower().endswith(".csv"):
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file)
+        return df
     except Exception as e:
-        st.warning(f"Error processing {_ticker}: {str(e)}")
+        st.error(f"Failed to parse file: {e}")
         return None
 
-def read_uploaded_sheet(uploaded_file):
-    xls = pd.ExcelFile(uploaded_file)
-    return pd.read_excel(xls, sheet_name=xls.sheet_names[0]), xls.sheet_names
 
-def clean_symbols(df: pd.DataFrame):
-    for col in ["Symbol", "Exchange"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().str.upper()
-    before = len(df)
-    need_cols = [c for c in ["Symbol", "Exchange"] if c in df.columns]
-    df = df.dropna(subset=need_cols).drop_duplicates("Symbol")
-    dropped = before - len(df)
-    return df, dropped
+def clean_symbols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Symbol", "Exchange"])
+    out = df.copy()
+    if "Symbol" not in out.columns:
+        st.error("Missing required 'Symbol' column.")
+        return pd.DataFrame(columns=["Symbol", "Exchange"])
+    if "Exchange" not in out.columns:
+        out["Exchange"] = ""
+    out["Symbol"] = out["Symbol"].astype(str).str.strip().str.upper()
+    out["Exchange"] = out["Exchange"].astype(str).str.strip().str.upper()
+    out = out.dropna(subset=["Symbol"])
+    out = out[out["Symbol"] != ""].drop_duplicates(subset=["Symbol"], keep="first")
+    return out
+
 
 def enrich_with_yf_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    if "YF_Symbol" not in df.columns:
-        df["YF_Symbol"] = df.apply(lambda r: map_to_yfinance_symbol(str(r["Symbol"]), str(r["Exchange"])), axis=1)
-    return df
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Symbol", "Exchange", "YF_Symbol"])
+    out = df.copy()
+    if "YF_Symbol" not in out.columns:
+        out["YF_Symbol"] = [
+            _map_to_yf_symbol(sym, ex, None) for sym, ex in zip(out["Symbol"], out["Exchange"])
+        ]
+    else:
+        out["YF_Symbol"] = [
+            _map_to_yf_symbol(sym, ex, yfs) for sym, ex, yfs in zip(out["Symbol"], out["Exchange"], out["YF_Symbol"])
+        ]
+    return out
+
+
+# -----------------------
+# Fetching
+# -----------------------
+class TemporaryFetchError(Exception):
+    pass
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def _cached_history(yf_symbol: str) -> pd.DataFrame:
+    # Cache just the raw history to keep calculate_momentum fast and uncached.
+    # Fetch 2 years to have enough bars for EMA200.
+    hist = yf.download(yf_symbol, period="2y", interval="1d", auto_adjust=False, progress=False)
+    # yf sometimes returns multiindex columns; normalize
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = [c[0] for c in hist.columns]
+    return hist
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.8, min=0.5, max=6),
+    retry=retry_if_exception_type(TemporaryFetchError)
+)
+def _fetch_one_history(yf_symbol: str) -> pd.DataFrame:
+    try:
+        hist = _cached_history(yf_symbol)
+        return hist
+    except Exception as e:
+        # Wrap in retry-able error
+        raise TemporaryFetchError(str(e))
+
+
+def _sleep_jitter():
+    time.sleep(random.uniform(*REQUEST_DELAY))
+
+
+def get_ticker_data(symbol: str, exchange: str, yf_symbol: str) -> Optional[Dict[str, Any]]:
+    yfs = _map_to_yf_symbol(symbol, exchange, yf_symbol)
+    _sleep_jitter()
+    hist = _fetch_one_history(yfs)
+
+    if hist is None or hist.empty or len(hist) < 60:
+        return None
+
+    # Require expected columns
+    required_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if not required_cols.issubset(set(hist.columns)):
+        return None
+
+    # Compute momentum & indicators
+    momentum = calculate_momentum(hist)
+    if not momentum:
+        return None
+
+    current_price = float(hist["Close"].iloc[-1])
+    five_day_change = float(((hist["Close"].iloc[-1] / hist["Close"].iloc[-5]) - 1) * 100) if len(hist) >= 5 else None
+    twenty_day_change = float(((hist["Close"].iloc[-1] / hist["Close"].iloc[-20]) - 1) * 100) if len(hist) >= 20 else None
+
+    out: Dict[str, Any] = {
+        "Symbol": symbol,
+        "Exchange": exchange,
+        "YF_Symbol": yfs,
+        "Price": current_price,
+        "5D_Change": round(five_day_change, 2) if five_day_change is not None else None,
+        "20D_Change": round(twenty_day_change, 2) if twenty_day_change is not None else None,
+    }
+    out.update(momentum)
+    return out
+
 
 def fetch_all(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    total = len(df)
+    """Parallel fetch across the ticker list and safe-merge any metadata back."""
+    rows: List[Dict[str, Any]] = []
+    total = len(df) if df is not None else 0
     if total == 0:
         return pd.DataFrame()
+
     progress = st.progress(0, text="Fetching ticker data...")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
-            executor.submit(get_ticker_data, row.get("Symbol",""), row.get("Exchange",""), row.get("YF_Symbol",""))
+            executor.submit(
+                get_ticker_data,
+                row.get("Symbol", ""),
+                row.get("Exchange", ""),
+                row.get("YF_Symbol", "")
+            )
             for _, row in df.iterrows()
         ]
         for i, f in enumerate(as_completed(futures), start=1):
-            data = f.result()
-            if data:
-                # Keep original metadata columns if present in input df (Sector/Industry/Country)
-                for meta_col in ["Sector", "Industry", "Country"]:
-                    if meta_col in df.columns:
-                        # Value from the source row by symbol (safe merge later is another option)
-                        pass
-                rows.append(data)
-            progress.progress(i / total, text=f"Processed {i}/{total} tickers")
+            try:
+                data = f.result()
+                if data:
+                    rows.append(data)
+            except Exception as e:
+                # Keep going; log to UI
+                st.info(f"Skipped one symbol due to error: {e}")
+            finally:
+                progress.progress(i / total, text=f"Processed {i}/{total} tickers")
 
     progress.empty()
     out = pd.DataFrame(rows)
 
-    # If the input df had metadata columns, merge them back by Symbol
-    meta_cols = [c for c in ["Sector", "Industry", "Country"] if c in df.columns]
+    # Nothing fetched → avoid merge on missing 'Symbol'
+    if out.empty or "Symbol" not in out.columns:
+        return out
+
+    # Merge back optional metadata if present in the uploaded sheet
+    exclude = {"Symbol", "Exchange", "YF_Symbol"}
+    meta_cols = [c for c in df.columns if c not in exclude]
     if meta_cols:
-        out = out.merge(df[["Symbol"] + meta_cols].drop_duplicates("Symbol"), on="Symbol", how="left")
+        right = df.loc[:, ["Symbol"] + meta_cols].drop_duplicates("Symbol")
+        out = out.merge(right, on="Symbol", how="left")
+
+    # Sort by score if present
+    if "Momentum_Score" in out.columns:
+        out = out.sort_values("Momentum_Score", ascending=False, kind="mergesort").reset_index(drop=True)
 
     return out
