@@ -16,6 +16,7 @@ from analysis import filter_results
 APP_TITLE = "Momentum Scanner (Modularized)"
 REQUIRED_COLUMNS = {"Symbol", "Exchange"}   # Other metadata columns are optional
 
+
 # -----------------------
 # Small UI helpers
 # -----------------------
@@ -53,13 +54,38 @@ def _download_csv_button(df: pd.DataFrame, label: str = "Download CSV"):
 
 
 def _download_xlsx_button(df: pd.DataFrame, label: str = "Download Excel"):
-    import pandas as pd
+    """
+    Robust Excel export:
+    - Try XlsxWriter
+    - Fallback to openpyxl
+    - If neither is installed, fall back to CSV
+    """
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
-    st.download_button(label, data=output.getvalue(),
-                       file_name="momentum_results.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Decide engine
+    engine = None
+    try:
+        import xlsxwriter  # noqa: F401
+        engine = "xlsxwriter"
+    except Exception:
+        try:
+            import openpyxl  # noqa: F401
+            engine = "openpyxl"
+        except Exception:
+            engine = None
+
+    if engine:
+        with pd.ExcelWriter(output, engine=engine) as writer:
+            df.to_excel(writer, index=False, sheet_name="Results")
+        st.download_button(
+            label,
+            data=output.getvalue(),
+            file_name="momentum_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("Excel engines not available in this environment. Falling back to CSV.")
+        _download_csv_button(df, "Download CSV (fallback)")
 
 
 def _apply_prefetch_filters(df: pd.DataFrame) -> pd.DataFrame:
@@ -151,11 +177,10 @@ def main():
             min_score = st.slider("Minimum Momentum Score", 0, 100, 60, 5, key="post_min_score")
             ex_post = ["All"] + sorted(results_df["Exchange"].dropna().unique().tolist())
             ex_selected = st.selectbox("Exchange (post)", options=ex_post, index=0, key="post_exchange")
-            sectors = _multiselect_all("Sector", sorted(results_df["Sector"].dropna().unique())) if "Sector" in results_df.columns else []
-            industries = _multiselect_all("Industry", sorted(results_df["Industry"].dropna().unique())) if "Industry" in results_df.columns else []
-            countries = _multiselect_all("Country", sorted(results_df["Country"].dropna().unique())) if "Country" in results_df.columns else []
 
-            # Assign explicit keys to avoid duplicates with Prefetch widgets
+            sectors = []
+            industries = []
+            countries = []
             if "Sector" in results_df.columns:
                 sectors = _multiselect_all("Sector", sorted(results_df["Sector"].dropna().unique()), key="post_sector")
             if "Industry" in results_df.columns:
@@ -175,8 +200,10 @@ def main():
         st.subheader("Results")
         st.dataframe(filtered, use_container_width=True)
         col1, col2 = st.columns(2)
-        with col1: _download_csv_button(filtered, "Download filtered CSV")
-        with col2: _download_xlsx_button(filtered, "Download filtered Excel")
+        with col1:
+            _download_csv_button(filtered, "Download filtered CSV")
+        with col2:
+            _download_xlsx_button(filtered, "Download filtered Excel")
 
         # 6) Symbol details
         symbol_options = ["(choose)"] + filtered["Symbol"].astype(str).tolist()
